@@ -25,7 +25,7 @@ fn main() -> Result<(), String> {
     }
 
     let read_bytes =
-        unsafe { libc::mq_receive(mq, buf.as_mut_ptr(), 8192, libc::PT_NULL as *mut u32) };
+        unsafe { libc::mq_receive(mq, buf.as_mut_ptr(), 8192, std::ptr::null_mut::<u32>()) };
     if read_bytes == -1_isize {
         return Err("mq_receive error".to_string());
     }

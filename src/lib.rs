@@ -1,3 +1,45 @@
+pub struct Attr {
+    flags: i64,
+    max_msg: i64,
+    msg_size: i64,
+    cur_msgs: i64,
+}
+
+impl Attr {
+    pub fn new(flags: i64, max_msg: i64, msg_size: i64, cur_msgs: i64) -> Self {
+        Self {
+            flags,
+            max_msg,
+            msg_size,
+            cur_msgs,
+        }
+    }
+
+    pub fn try_new_with_sized_type<T>(flags: i64, max_msg: i64, cur_msgs: i64) -> Option<Self> {
+        let size_of_t = std::mem::size_of::<T>();
+        let attr_msgsize = i64::try_from(size_of_t).ok()?;
+
+        Some(Self {
+            flags,
+            max_msg,
+            msg_size: attr_msgsize,
+            cur_msgs,
+        })
+    }
+
+    pub fn to_mq_attr(&self) -> libc::mq_attr {
+        unsafe {
+            let mut uninit_attr = std::mem::MaybeUninit::<libc::mq_attr>::uninit();
+            let p = uninit_attr.as_mut_ptr();
+            (*p).mq_flags = self.flags;
+            (*p).mq_maxmsg = self.max_msg;
+            (*p).mq_msgsize = self.msg_size;
+            (*p).mq_curmsgs = self.cur_msgs;
+            uninit_attr.assume_init()
+        }
+    }
+}
+
 pub struct Sender<T, SID>
 where
     SID: AsRef<str>,

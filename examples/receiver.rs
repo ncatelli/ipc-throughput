@@ -1,36 +1,28 @@
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+use std::io::Read;
 
-const MSG_SIZE: usize = 4096;
+use ipc_throughput::*;
+
+const MSG_SIZE: usize = 8196;
 
 fn main() -> Result<(), String> {
-    let mut buf: [libc::c_char; MSG_SIZE] = [0; MSG_SIZE];
-    let name = CString::new("/test_queue").unwrap();
+    let mut buf: [u8; MSG_SIZE] = [0; MSG_SIZE];
 
-    let attr_msgsize = i64::try_from(MSG_SIZE).map_err(|e| e.to_string())?;
-    let attr = ipc_throughput::MQueueAttr::new(0, 10, attr_msgsize, 0).to_mq_attr();
+    let attr_msgsize = i64::try_from(buf.len()).map_err(|e| e.to_string())?;
+    let mut mq = MessageQueue::<&str>::try_new_with_attr(
+        "/test_queue",
+        MQueueFlags::new(MQueueMode::ReadOnly).with_option(MQueueOption::Create),
+        MQueueAttr::new(0, 10, attr_msgsize, 0),
+    )
+    .ok_or_else(|| "mq_open error".to_string())?;
 
-    let mq = unsafe { libc::mq_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600, &attr) };
+    let read_bytes = mq.read(&mut buf).map_err(|e| e.to_string())?;
 
-    if mq == -1_isize as libc::mqd_t {
-        return Err("mq_open error".to_string());
-    }
-
-    let read_bytes =
-        unsafe { libc::mq_receive(mq, buf.as_mut_ptr(), 8192, std::ptr::null_mut::<u32>()) };
-    if read_bytes == -1_isize {
-        return Err("mq_receive error".to_string());
-    }
-
-    let buf_str = unsafe { CStr::from_ptr(buf.as_ptr()) }
+    let buf_str = unsafe { CStr::from_ptr(buf.as_ptr() as *const i8) }
         .to_str()
         .map_err(|e| e.to_string())?;
 
     println!("read: {}\n{}", read_bytes, buf_str);
-
-    unsafe {
-        libc::mq_close(mq);
-        libc::mq_unlink(name.as_c_str().as_ptr())
-    };
 
     Ok(())
 }

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 
 pub struct MQueueAttr {
@@ -44,18 +45,42 @@ impl MQueueAttr {
 
 pub struct Sender<T: Sendable> {
     _shm: Arc<SharedMem<T>>,
-    _mqueue: Arc<MessageQueue<T>>,
+    mqueue: Arc<RefCell<MessageQueue<T>>>,
 }
 
 impl<T: Sendable> Sender<T> {
-    fn new(_shm: Arc<SharedMem<T>>, _mqueue: Arc<MessageQueue<T>>) -> Self {
-        Self { _shm, _mqueue }
+    fn new(_shm: Arc<SharedMem<T>>, mqueue: Arc<RefCell<MessageQueue<T>>>) -> Self {
+        Self { _shm, mqueue }
+    }
+}
+
+impl<T> std::io::Write for Sender<T>
+where
+    T: Sendable,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut queue = self.mqueue.as_ref().borrow_mut();
+        queue.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
 pub struct Receiver<T: Sendable> {
     _shm: Arc<SharedMem<T>>,
-    _mqueue: Arc<MessageQueue<T>>,
+    mqueue: Arc<RefCell<MessageQueue<T>>>,
+}
+
+impl<T> std::io::Read for Receiver<T>
+where
+    T: Sendable,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut queue = self.mqueue.as_ref().borrow_mut();
+        queue.read(buf)
+    }
 }
 
 #[repr(i32)]
@@ -220,7 +245,7 @@ where
     T: Sendable,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // lying to c, by casting the pointer.
+        // lying to c by casting the pointer.
         let cast_ptr = buf.as_ptr() as *const i8;
         let data_size = buf.len();
 
@@ -236,6 +261,33 @@ where
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl<T> std::io::Read for MessageQueue<T>
+where
+    T: Sendable,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // lying to c by casting the pointer.
+        let cast_ptr = buf.as_mut_ptr() as *mut i8;
+
+        let read_bytes = unsafe {
+            libc::mq_receive(self.descriptor, cast_ptr, 8192, std::ptr::null_mut::<u32>())
+        };
+
+        match read_bytes {
+            -1 => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "unable to read from queue",
+            )),
+            read => usize::try_from(read).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "read bytes falls outside expected range.",
+                )
+            }),
+        }
     }
 }
 
@@ -268,7 +320,9 @@ where
     let name = queue_id.as_ref();
 
     let mq_flags = MQueueFlags::new(MQueueMode::WriteOnly).with_option(MQueueOption::Create);
-    let mq = MessageQueue::<T>::try_new(name, mq_flags).map(Arc::new)?;
+    let mq = MessageQueue::<T>::try_new(name, mq_flags)
+        .map(RefCell::new)
+        .map(Arc::new)?;
 
     let shm = SharedMem::<T>::try_new(name).map(Arc::new)?;
     let _sender = Sender::new(shm, mq);

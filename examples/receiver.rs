@@ -7,7 +7,7 @@ fn main() -> Result<(), String> {
     let name = CString::new("/test_queue").unwrap();
 
     let attr_msgsize = i64::try_from(MSG_SIZE).map_err(|e| e.to_string())?;
-    let attr = ipc_throughput::Attr::new(0, 10, attr_msgsize, 0).to_mq_attr();
+    let attr = ipc_throughput::MQueueAttr::new(0, 10, attr_msgsize, 0).to_mq_attr();
 
     let mq = unsafe { libc::mq_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600, &attr) };
 

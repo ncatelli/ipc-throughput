@@ -43,18 +43,18 @@ impl MQueueAttr {
     }
 }
 
-pub struct Sender<T: Sendable> {
-    _shm: Arc<SharedMem<T>>,
+pub struct Sender<T: Sendable, const CAP: usize> {
+    _shm: Arc<SharedMem<T, CAP>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
 }
 
-impl<T: Sendable> Sender<T> {
-    fn new(_shm: Arc<SharedMem<T>>, mqueue: Arc<RefCell<MessageQueue<T>>>) -> Self {
+impl<T: Sendable, const CAP: usize> Sender<T, CAP> {
+    fn new(_shm: Arc<SharedMem<T, CAP>>, mqueue: Arc<RefCell<MessageQueue<T>>>) -> Self {
         Self { _shm, mqueue }
     }
 }
 
-impl<T> std::io::Write for Sender<T>
+impl<T, const CAP: usize> std::io::Write for Sender<T, CAP>
 where
     T: Sendable,
 {
@@ -68,12 +68,12 @@ where
     }
 }
 
-pub struct Receiver<T: Sendable> {
-    _shm: Arc<SharedMem<T>>,
+pub struct Receiver<T: Sendable, const CAP: usize> {
+    _shm: Arc<SharedMem<T, CAP>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
 }
 
-impl<T> std::io::Read for Receiver<T>
+impl<T, const CAP: usize> std::io::Read for Receiver<T, CAP>
 where
     T: Sendable,
 {
@@ -297,22 +297,242 @@ impl<T: Sendable> Drop for MessageQueue<T> {
     }
 }
 
-struct SharedMem<T: Sendable> {
-    _data_type: std::marker::PhantomData<T>,
-    _shm_name: std::ffi::CString,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum MMapProt {
+    None = libc::PROT_NONE,
+    Read = libc::PROT_READ,
+    Write = libc::PROT_WRITE,
+    Exec = libc::PROT_EXEC,
 }
 
-impl<T: Sendable> SharedMem<T> {
-    fn try_new<ID: AsRef<str>>(shm_name: ID) -> Option<Self> {
-        let name = std::ffi::CString::new(shm_name.as_ref()).ok()?;
-        Some(Self {
+impl MMapProt {
+    pub fn as_i32(&self) -> i32 {
+        *self as i32
+    }
+
+    pub fn as_c_int(&self) -> libc::c_int {
+        *self as libc::c_int
+    }
+}
+
+#[repr(i32)]
+pub enum MMapMode {
+    Shared = libc::MAP_SHARED,
+    SharedValidate = libc::MAP_SHARED_VALIDATE,
+    Private = libc::MAP_PRIVATE,
+}
+
+#[repr(i32)]
+pub enum MMapOption {
+    M32Bit = libc::MAP_32BIT,
+    Anonymous = libc::MAP_ANONYMOUS,
+    DenyWrite = libc::MAP_DENYWRITE,
+    Executable = libc::MAP_EXECUTABLE,
+    File = libc::MAP_FILE,
+    Fixed = libc::MAP_FIXED,
+    FixedNoReplace = libc::MAP_FIXED_NOREPLACE,
+    GrowsDown = libc::MAP_GROWSDOWN,
+    HugeTLB = libc::MAP_HUGETLB,
+    HugeTLB2MB = libc::MAP_HUGE_2MB,
+    HugeTLB1GB = libc::MAP_HUGE_1GB,
+    Locked = libc::MAP_LOCKED,
+    NonBlock = libc::MAP_NONBLOCK,
+    NoReserve = libc::MAP_NORESERVE,
+    Populate = libc::MAP_POPULATE,
+    Stack = libc::MAP_STACK,
+    Sync = libc::MAP_SYNC,
+}
+
+#[derive(Default)]
+pub struct MMapFlags(libc::c_int);
+
+impl MMapFlags {
+    pub fn new(intial_mode: libc::c_int) -> Self {
+        Self(intial_mode)
+    }
+
+    pub fn with_option(self, option: MMapOption) -> Self {
+        let new_flags = self.0 | (option as libc::c_int);
+        Self(new_flags)
+    }
+}
+
+impl MMapFlags {
+    pub fn as_i32(&self) -> i32 {
+        self.0
+    }
+
+    pub fn as_c_int(&self) -> libc::c_int {
+        self.0
+    }
+}
+
+pub struct MMap<'fd, T: Sendable, const CAP: usize> {
+    _data_type: std::marker::PhantomData<T>,
+    raw_ptr: *mut libc::c_void,
+    len: usize,
+    _fd: &'fd SharedMemDescriptor,
+}
+
+impl<'fd, T: Sendable, const CAP: usize> MMap<'fd, T, CAP> {
+    pub fn try_new(
+        fd: &'fd SharedMemDescriptor,
+        len: usize,
+        prot: MMapProt,
+        flags: MMapFlags,
+    ) -> Option<Self> {
+        let fd_ptr = fd.as_ref();
+        let raw_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                prot.as_c_int(),
+                flags.as_c_int(),
+                *fd_ptr,
+                0,
+            )
+        };
+
+        (!raw_ptr.is_null()).then_some(Self {
             _data_type: std::marker::PhantomData,
-            _shm_name: name,
+            raw_ptr,
+            len,
+            _fd: fd,
         })
     }
 }
 
-pub fn bounded_sync_sender<ID, T>(queue_id: ID) -> Option<Sender<T>>
+impl<'fd, T: Sendable, const CAP: usize> AsRef<[T]> for MMap<'fd, T, CAP> {
+    fn as_ref(&self) -> &[T] {
+        let slice = unsafe {
+            let ptr: &T = &*(self.raw_ptr as *const T);
+            std::slice::from_raw_parts(ptr, CAP)
+        };
+
+        slice
+    }
+}
+
+impl<'fd, T: Sendable, const CAP: usize> AsMut<[T]> for MMap<'fd, T, CAP> {
+    fn as_mut(&mut self) -> &mut [T] {
+        let slice = unsafe {
+            let ptr: &mut T = &mut *(self.raw_ptr as *mut T);
+            std::slice::from_raw_parts_mut(ptr, CAP)
+        };
+
+        slice
+    }
+}
+
+impl<'fd, T: Sendable, const CAP: usize> Drop for MMap<'fd, T, CAP> {
+    fn drop(&mut self) {
+        if !self.raw_ptr.is_null() {
+            unsafe { libc::munmap(self.raw_ptr, self.len) };
+        }
+    }
+}
+
+pub struct SharedMemDescriptor(libc::c_int);
+
+impl SharedMemDescriptor {
+    pub fn try_new(descriptor: libc::c_int) -> Option<Self> {
+        (descriptor != 0).then_some(Self(descriptor))
+    }
+}
+
+impl AsRef<libc::c_int> for SharedMemDescriptor {
+    fn as_ref(&self) -> &libc::c_int {
+        &self.0
+    }
+}
+
+#[repr(i32)]
+pub enum SharedMemMode {
+    ReadOnly = libc::O_RDONLY,
+    ReadWrite = libc::O_RDWR,
+}
+
+#[repr(i32)]
+pub enum SharedMemOption {
+    Create = libc::O_CREAT,
+    Exclusive = libc::O_EXCL,
+    Truncate = libc::O_TRUNC,
+}
+
+#[derive(Default)]
+pub struct SharedMemFlags(libc::c_int);
+
+impl SharedMemFlags {
+    pub fn new(mode: SharedMemMode) -> Self {
+        Self(mode as i32)
+    }
+
+    pub fn with_option(self, option: SharedMemOption) -> Self {
+        let new_flags = self.0 | (option as i32);
+        Self(new_flags)
+    }
+}
+
+impl SharedMemFlags {
+    pub fn as_i32(&self) -> i32 {
+        self.0
+    }
+
+    pub fn as_c_int(&self) -> libc::c_int {
+        self.0
+    }
+}
+
+pub struct SharedMem<T: Sendable, const CAP: usize> {
+    _data_type: std::marker::PhantomData<T>,
+    _shm_name: std::ffi::CString,
+    descriptor: SharedMemDescriptor,
+}
+
+impl<T: Sendable, const CAP: usize> SharedMem<T, CAP> {
+    #[allow(unused)]
+    pub fn try_new<ID: AsRef<str>>(shm_name: ID, flags: SharedMemFlags) -> Option<Self> {
+        let name = std::ffi::CString::new(shm_name.as_ref()).ok()?;
+        let user_rw_perms = 0o600;
+        let buf_size = std::mem::size_of::<T>() * CAP;
+
+        let off_t_buf_size = libc::off_t::try_from(buf_size).ok()?;
+
+        let open_rv =
+            unsafe { libc::shm_open(name.as_c_str().as_ptr(), flags.as_c_int(), user_rw_perms) };
+
+        // truncate if opened, successfully, returning the file descriptor.
+        let fd = match open_rv {
+            -1 => None,
+            descriptor => Some(descriptor),
+        }
+        .and_then(|fd| match unsafe { libc::ftruncate(fd, off_t_buf_size) } {
+            0 => Some(fd),
+            _ => None,
+        })
+        .and_then(SharedMemDescriptor::try_new)?;
+
+        Some(Self {
+            _data_type: std::marker::PhantomData,
+            _shm_name: name,
+            descriptor: fd,
+        })
+    }
+
+    pub fn borrow_descriptor(&self) -> &SharedMemDescriptor {
+        &self.descriptor
+    }
+}
+
+impl<T: Sendable, const CAP: usize> Drop for SharedMem<T, CAP> {
+    fn drop(&mut self) {
+        let descriptor = self.descriptor.as_ref();
+        unsafe { libc::close(*descriptor) };
+    }
+}
+
+pub fn bounded_sync_sender<ID, T, const CAP: usize>(queue_id: ID) -> Option<Sender<T, CAP>>
 where
     ID: AsRef<str>,
     T: Sendable,
@@ -324,7 +544,9 @@ where
         .map(RefCell::new)
         .map(Arc::new)?;
 
-    let shm = SharedMem::<T>::try_new(name).map(Arc::new)?;
+    let shm_flags =
+        SharedMemFlags::new(SharedMemMode::ReadOnly).with_option(SharedMemOption::Create);
+    let shm = SharedMem::<T, CAP>::try_new(name, shm_flags).map(Arc::new)?;
     let _sender = Sender::new(shm, mq);
 
     None

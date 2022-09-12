@@ -43,18 +43,18 @@ impl MQueueAttr {
     }
 }
 
-pub struct Sender<T: Sendable, const CAP: usize> {
-    _shm: Arc<SharedMem<T, CAP>>,
+pub struct Sender<'shmfd, T: Sendable, const CAP: usize> {
+    _mmap: Arc<MMap<'shmfd, T, CAP>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
 }
 
-impl<T: Sendable, const CAP: usize> Sender<T, CAP> {
-    fn new(_shm: Arc<SharedMem<T, CAP>>, mqueue: Arc<RefCell<MessageQueue<T>>>) -> Self {
-        Self { _shm, mqueue }
+impl<'shmfd, T: Sendable, const CAP: usize> Sender<'shmfd, T, CAP> {
+    pub fn new(_mmap: Arc<MMap<'shmfd, T, CAP>>, mqueue: Arc<RefCell<MessageQueue<T>>>) -> Self {
+        Self { _mmap, mqueue }
     }
 }
 
-impl<T, const CAP: usize> std::io::Write for Sender<T, CAP>
+impl<'shmfd, T, const CAP: usize> std::io::Write for Sender<'shmfd, T, CAP>
 where
     T: Sendable,
 {
@@ -344,12 +344,11 @@ pub enum MMapOption {
     Sync = libc::MAP_SYNC,
 }
 
-#[derive(Default)]
 pub struct MMapFlags(libc::c_int);
 
 impl MMapFlags {
-    pub fn new(intial_mode: libc::c_int) -> Self {
-        Self(intial_mode)
+    pub fn new(intial_mode: MMapMode) -> Self {
+        Self(intial_mode as i32)
     }
 
     pub fn with_option(self, option: MMapOption) -> Self {
@@ -376,12 +375,8 @@ pub struct MMap<'fd, T: Sendable, const CAP: usize> {
 }
 
 impl<'fd, T: Sendable, const CAP: usize> MMap<'fd, T, CAP> {
-    pub fn try_new(
-        fd: &'fd SharedMemDescriptor,
-        len: usize,
-        prot: MMapProt,
-        flags: MMapFlags,
-    ) -> Option<Self> {
+    pub fn try_new(fd: &'fd SharedMemDescriptor, prot: MMapProt, flags: MMapFlags) -> Option<Self> {
+        let len = CAP;
         let fd_ptr = fd.as_ref();
         let raw_ptr = unsafe {
             libc::mmap(
@@ -486,7 +481,7 @@ impl SharedMemFlags {
 
 pub struct SharedMem<T: Sendable, const CAP: usize> {
     _data_type: std::marker::PhantomData<T>,
-    _shm_name: std::ffi::CString,
+    shm_name: std::ffi::CString,
     descriptor: SharedMemDescriptor,
 }
 
@@ -515,7 +510,7 @@ impl<T: Sendable, const CAP: usize> SharedMem<T, CAP> {
 
         Some(Self {
             _data_type: std::marker::PhantomData,
-            _shm_name: name,
+            shm_name: name,
             descriptor: fd,
         })
     }
@@ -532,22 +527,25 @@ impl<T: Sendable, const CAP: usize> Drop for SharedMem<T, CAP> {
     }
 }
 
-pub fn bounded_sync_sender<ID, T, const CAP: usize>(queue_id: ID) -> Option<Sender<T, CAP>>
+pub fn bounded_sync_sender<ID, T, const CAP: usize>(
+    shm: &SharedMem<T, CAP>,
+) -> Option<Sender<T, CAP>>
 where
     ID: AsRef<str>,
     T: Sendable,
 {
-    let name = queue_id.as_ref();
+    let name = shm.shm_name.to_str().ok()?;
 
     let mq_flags = MQueueFlags::new(MQueueMode::WriteOnly).with_option(MQueueOption::Create);
     let mq = MessageQueue::<T>::try_new(name, mq_flags)
         .map(RefCell::new)
         .map(Arc::new)?;
 
-    let shm_flags =
-        SharedMemFlags::new(SharedMemMode::ReadOnly).with_option(SharedMemOption::Create);
-    let shm = SharedMem::<T, CAP>::try_new(name, shm_flags).map(Arc::new)?;
-    let _sender = Sender::new(shm, mq);
+    let mmap_flags = MMapFlags::new(MMapMode::Shared);
+    let mmap: Arc<MMap<T, CAP>> =
+        MMap::try_new(&shm.descriptor, MMapProt::Write, mmap_flags).map(Arc::new)?;
+
+    let _sender = Sender::new(mmap, mq);
 
     None
 }

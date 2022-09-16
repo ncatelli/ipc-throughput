@@ -71,12 +71,21 @@ where
     }
 }
 
-pub struct Receiver<T: Sendable, const CAP: usize> {
-    _shm: Arc<SharedMem<T, CAP>>,
+pub struct Receiver<'fd, T: Sendable, const CAP: usize> {
+    _shm: Arc<RefCell<MMap<'fd, T, CAP>>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
 }
 
-impl<T, const CAP: usize> std::io::Read for Receiver<T, CAP>
+impl<'fd, T: Sendable, const CAP: usize> Receiver<'fd, T, CAP> {
+    pub fn new(
+        _shm: Arc<RefCell<MMap<'fd, T, CAP>>>,
+        mqueue: Arc<RefCell<MessageQueue<T>>>,
+    ) -> Self {
+        Self { _shm, mqueue }
+    }
+}
+
+impl<'fd, T, const CAP: usize> std::io::Read for Receiver<'fd, T, CAP>
 where
     T: Sendable,
 {
@@ -538,7 +547,9 @@ where
         &queue_name,
         MQueueFlags::new(MQueueMode::WriteOnly).with_option(MQueueOption::Create),
         MQueueAttr::new(0, 10, attr_msgsize, 0),
-    )?;
+    )
+    .map(RefCell::new)
+    .map(Arc::new)?;
 
     let mmap_flags = MMapFlags::new(MMapMode::Shared);
     let mmap: Arc<RefCell<MMap<T, CAP>>> =
@@ -546,5 +557,33 @@ where
             .map(RefCell::new)
             .map(Arc::new)?;
 
-    Some(Sender::new(mmap, Arc::new(RefCell::new(mq))))
+    Some(Sender::new(mmap, mq))
+}
+
+pub fn bounded_sync_receiver<T, const CAP: usize>(
+    shm: &SharedMem<T, CAP>,
+) -> Option<Receiver<T, CAP>>
+where
+    T: Sendable,
+{
+    let shm_name = shm.shm_name.to_str().ok()?;
+    let queue_name = format!("/{}", shm_name);
+
+    let attr_msgsize = i64::try_from(T::data_size()).ok()?;
+
+    let mq = MessageQueue::<T>::try_new_with_attr(
+        &queue_name,
+        MQueueFlags::new(MQueueMode::ReadOnly).with_option(MQueueOption::Create),
+        MQueueAttr::new(0, 10, attr_msgsize, 0),
+    )
+    .map(RefCell::new)
+    .map(Arc::new)?;
+
+    let mmap_flags = MMapFlags::new(MMapMode::Shared);
+    let mmap: Arc<RefCell<MMap<T, CAP>>> =
+        MMap::try_new(&shm.descriptor, MMapProt::Read, mmap_flags)
+            .map(RefCell::new)
+            .map(Arc::new)?;
+
+    Some(Receiver::new(mmap, mq))
 }

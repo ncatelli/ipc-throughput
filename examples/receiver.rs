@@ -8,9 +8,9 @@ const MSG_SIZE: usize = 8196;
 fn main() -> Result<(), String> {
     let mut buf: [u8; MSG_SIZE] = [0; MSG_SIZE];
 
-    let attr_msgsize = i64::try_from(buf.len()).map_err(|e| e.to_string())?;
+    let attr_msgsize = i64::try_from(<[u8; MSG_SIZE]>::data_size()).map_err(|e| e.to_string())?;
     let mut mq = MessageQueue::<&str>::try_new_with_attr(
-        "/test_queue",
+        "/test",
         MQueueFlags::new(MQueueMode::ReadOnly).with_option(MQueueOption::Create),
         MQueueAttr::new(0, 10, attr_msgsize, 0),
     )

@@ -44,12 +44,15 @@ impl MQueueAttr {
 }
 
 pub struct Sender<'shmfd, T: Sendable, const CAP: usize> {
-    _mmap: Arc<MMap<'shmfd, T, CAP>>,
+    _mmap: Arc<RefCell<MMap<'shmfd, T, CAP>>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
 }
 
 impl<'shmfd, T: Sendable, const CAP: usize> Sender<'shmfd, T, CAP> {
-    pub fn new(_mmap: Arc<MMap<'shmfd, T, CAP>>, mqueue: Arc<RefCell<MessageQueue<T>>>) -> Self {
+    pub fn new(
+        _mmap: Arc<RefCell<MMap<'shmfd, T, CAP>>>,
+        mqueue: Arc<RefCell<MessageQueue<T>>>,
+    ) -> Self {
         Self { _mmap, mqueue }
     }
 }
@@ -123,57 +126,50 @@ impl MQueueFlags {
 }
 
 pub trait Sendable {
-    fn data_size(&self) -> usize;
+    fn data_size() -> usize {
+        8192
+    }
+
     fn encode(&self) -> &[u8];
 }
 
 impl Sendable for std::ffi::CStr {
-    fn data_size(&self) -> usize {
-        self.to_bytes_with_nul().len()
-    }
-
     fn encode(&self) -> &[u8] {
         self.to_bytes_with_nul()
     }
 }
 
 impl Sendable for std::ffi::CString {
-    fn data_size(&self) -> usize {
-        self.as_c_str().data_size()
-    }
-
     fn encode(&self) -> &[u8] {
         self.as_c_str().encode()
     }
 }
 
 impl Sendable for &[u8] {
-    fn data_size(&self) -> usize {
-        self.len()
-    }
-
     fn encode(&self) -> &[u8] {
         self
     }
 }
 
 impl Sendable for &str {
-    fn data_size(&self) -> usize {
-        self.as_bytes().len()
-    }
-
     fn encode(&self) -> &[u8] {
         self.as_bytes()
     }
 }
 
 impl Sendable for String {
-    fn data_size(&self) -> usize {
-        self.as_bytes().len()
+    fn encode(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl<const N: usize> Sendable for [u8; N] {
+    fn data_size() -> usize {
+        N
     }
 
     fn encode(&self) -> &[u8] {
-        self.as_bytes()
+        self.as_slice()
     }
 }
 
@@ -190,10 +186,11 @@ impl<T: Sendable> MessageQueue<T> {
     pub fn try_new<ID: AsRef<str>>(queue_name: ID, flags: MQueueFlags) -> Option<Self> {
         let name = std::ffi::CString::new(queue_name.as_ref()).ok()?;
         let user_rw_perms = 0o600;
+        let name_ptr = name.as_ptr();
 
         let open_rv = unsafe {
             libc::mq_open(
-                name.as_c_str().as_ptr(),
+                name_ptr,
                 flags.as_c_int(),
                 user_rw_perms,
                 std::ptr::null::<libc::mq_attr>(),
@@ -210,13 +207,14 @@ impl<T: Sendable> MessageQueue<T> {
         }
     }
 
-    #[allow(unused)]
     pub fn try_new_with_attr<ID: AsRef<str>>(
         queue_name: ID,
         flags: MQueueFlags,
         attr: MQueueAttr,
     ) -> Option<Self> {
-        let name = std::ffi::CString::new(queue_name.as_ref()).ok()?;
+        let queue_str = queue_name.as_ref();
+
+        let name = std::ffi::CString::new(queue_str).ok()?;
         let attr_ptr = attr.to_mq_attr();
         let user_rw_perms = 0o600;
 
@@ -527,25 +525,26 @@ impl<T: Sendable, const CAP: usize> Drop for SharedMem<T, CAP> {
     }
 }
 
-pub fn bounded_sync_sender<ID, T, const CAP: usize>(
-    shm: &SharedMem<T, CAP>,
-) -> Option<Sender<T, CAP>>
+pub fn bounded_sync_sender<T, const CAP: usize>(shm: &SharedMem<T, CAP>) -> Option<Sender<T, CAP>>
 where
-    ID: AsRef<str>,
     T: Sendable,
 {
-    let name = shm.shm_name.to_str().ok()?;
+    let shm_name = shm.shm_name.to_str().ok()?;
+    let queue_name = format!("/{}", shm_name);
 
-    let mq_flags = MQueueFlags::new(MQueueMode::WriteOnly).with_option(MQueueOption::Create);
-    let mq = MessageQueue::<T>::try_new(name, mq_flags)
-        .map(RefCell::new)
-        .map(Arc::new)?;
+    let attr_msgsize = i64::try_from(T::data_size()).ok()?;
+
+    let mq = MessageQueue::<T>::try_new_with_attr(
+        &queue_name,
+        MQueueFlags::new(MQueueMode::WriteOnly).with_option(MQueueOption::Create),
+        MQueueAttr::new(0, 10, attr_msgsize, 0),
+    )?;
 
     let mmap_flags = MMapFlags::new(MMapMode::Shared);
-    let mmap: Arc<MMap<T, CAP>> =
-        MMap::try_new(&shm.descriptor, MMapProt::Write, mmap_flags).map(Arc::new)?;
+    let mmap: Arc<RefCell<MMap<T, CAP>>> =
+        MMap::try_new(&shm.descriptor, MMapProt::Write, mmap_flags)
+            .map(RefCell::new)
+            .map(Arc::new)?;
 
-    let _sender = Sender::new(mmap, mq);
-
-    None
+    Some(Sender::new(mmap, Arc::new(RefCell::new(mq))))
 }

@@ -59,7 +59,7 @@ impl<'shmfd, T: Sendable, const CAP: usize> Sender<'shmfd, T, CAP> {
 
 impl<'shmfd, T, const CAP: usize> std::io::Write for Sender<'shmfd, T, CAP>
 where
-    T: Sendable,
+    T: SendEncodable + Sendable,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut queue = self.mqueue.as_ref().borrow_mut();
@@ -87,7 +87,7 @@ impl<'fd, T: Sendable, const CAP: usize> Receiver<'fd, T, CAP> {
 
 impl<'fd, T, const CAP: usize> std::io::Read for Receiver<'fd, T, CAP>
 where
-    T: Sendable,
+    T: SendEncodable + Sendable,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut queue = self.mqueue.as_ref().borrow_mut();
@@ -134,41 +134,60 @@ impl MQueueFlags {
     }
 }
 
+/// A Marker trait for data that can be sent over a queue
 pub trait Sendable {
     fn data_size() -> usize {
         8192
     }
+}
 
+pub trait SendEncodable {
     fn encode(&self) -> &[u8];
 }
 
-impl Sendable for std::ffi::CStr {
+impl SendEncodable for std::ffi::CStr {
     fn encode(&self) -> &[u8] {
         self.to_bytes_with_nul()
     }
 }
 
-impl Sendable for std::ffi::CString {
+impl Sendable for std::ffi::CStr {}
+
+impl SendEncodable for std::ffi::CString {
     fn encode(&self) -> &[u8] {
         self.as_c_str().encode()
     }
 }
 
-impl Sendable for &[u8] {
+impl Sendable for std::ffi::CString {}
+
+impl SendEncodable for &[u8] {
     fn encode(&self) -> &[u8] {
         self
     }
 }
 
-impl Sendable for &str {
+impl Sendable for &[u8] {}
+
+impl SendEncodable for &str {
     fn encode(&self) -> &[u8] {
         self.as_bytes()
     }
 }
 
-impl Sendable for String {
+impl Sendable for &str {}
+
+impl SendEncodable for String {
     fn encode(&self) -> &[u8] {
         self.as_bytes()
+    }
+}
+
+impl Sendable for String {}
+
+impl<const N: usize> SendEncodable for [u8; N] {
+    fn encode(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
@@ -176,9 +195,12 @@ impl<const N: usize> Sendable for [u8; N] {
     fn data_size() -> usize {
         N
     }
+}
 
-    fn encode(&self) -> &[u8] {
-        self.as_slice()
+impl Sendable for usize {
+    fn data_size() -> usize {
+        // Should always be either 4 or 8, safe to unwrap the conversion.
+        usize::try_from(usize::BITS / 8).unwrap()
     }
 }
 
@@ -249,7 +271,7 @@ impl<T: Sendable> MessageQueue<T> {
 
 impl<T> std::io::Write for MessageQueue<T>
 where
-    T: Sendable,
+    T: SendEncodable + Sendable,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // lying to c by casting the pointer.
@@ -271,9 +293,29 @@ where
     }
 }
 
+impl std::io::Write for MessageQueue<usize> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let cast_ptr = buf.as_ptr() as *const i8;
+        let data_size = usize::data_size();
+
+        let rv = unsafe { libc::mq_send(self.descriptor, cast_ptr, buf.len(), 0) };
+        match rv {
+            0 => Ok(data_size),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "data exceeds message size",
+            )),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl<T> std::io::Read for MessageQueue<T>
 where
-    T: Sendable,
+    T: SendEncodable + Sendable,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // lying to c by casting the pointer.
@@ -281,6 +323,36 @@ where
 
         let read_bytes = unsafe {
             libc::mq_receive(self.descriptor, cast_ptr, 8192, std::ptr::null_mut::<u32>())
+        };
+
+        match read_bytes {
+            -1 => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "unable to read from queue",
+            )),
+            read => usize::try_from(read).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "read bytes falls outside expected range.",
+                )
+            }),
+        }
+    }
+}
+
+impl std::io::Read for MessageQueue<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // lying to c by casting the pointer.
+        let cast_ptr = buf.as_mut_ptr() as *mut i8;
+        let data_size = usize::data_size();
+
+        let read_bytes = unsafe {
+            libc::mq_receive(
+                self.descriptor,
+                cast_ptr,
+                data_size,
+                std::ptr::null_mut::<u32>(),
+            )
         };
 
         match read_bytes {

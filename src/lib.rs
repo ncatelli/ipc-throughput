@@ -44,16 +44,16 @@ impl MQueueAttr {
 }
 
 pub struct Sender<'shmfd, T: Sendable, const CAP: usize> {
-    _mmap: Arc<RefCell<MMap<'shmfd, T, CAP>>>,
+    mmap: Arc<RefCell<MMap<'shmfd, T, CAP>>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
 }
 
 impl<'shmfd, T: Sendable, const CAP: usize> Sender<'shmfd, T, CAP> {
     pub fn new(
-        _mmap: Arc<RefCell<MMap<'shmfd, T, CAP>>>,
+        mmap: Arc<RefCell<MMap<'shmfd, T, CAP>>>,
         mqueue: Arc<RefCell<MessageQueue<T>>>,
     ) -> Self {
-        Self { _mmap, mqueue }
+        Self { mmap, mqueue }
     }
 }
 
@@ -63,7 +63,10 @@ where
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut queue = self.mqueue.as_ref().borrow_mut();
-        queue.write(buf)
+        let mut mmap_ref = self.mmap.as_ref().borrow_mut();
+        let mut mmap: &mut [u8] = mmap_ref.as_mut();
+
+        queue.write(buf).and_then(|_| mmap.write(buf))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -72,16 +75,16 @@ where
 }
 
 pub struct Receiver<'fd, T: Sendable, const CAP: usize> {
-    _shm: Arc<RefCell<MMap<'fd, T, CAP>>>,
+    mmap: Arc<RefCell<MMap<'fd, T, CAP>>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
 }
 
 impl<'fd, T: Sendable, const CAP: usize> Receiver<'fd, T, CAP> {
     pub fn new(
-        _shm: Arc<RefCell<MMap<'fd, T, CAP>>>,
+        mmap: Arc<RefCell<MMap<'fd, T, CAP>>>,
         mqueue: Arc<RefCell<MessageQueue<T>>>,
     ) -> Self {
-        Self { _shm, mqueue }
+        Self { mmap, mqueue }
     }
 }
 
@@ -91,7 +94,20 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut queue = self.mqueue.as_ref().borrow_mut();
-        queue.read(buf)
+        let data_size = T::data_size();
+        let mmap_ref = self.mmap.as_ref().borrow();
+        let mmap: &[u8] = mmap_ref.as_ref();
+        let subset = &mmap[0..data_size];
+
+        let read = queue.read(buf);
+        buf.fill(0);
+        match read {
+            Ok(read_n) => {
+                (&mut buf[0..data_size]).clone_from_slice(subset);
+                Ok(read_n)
+            }
+            e @ Err(_) => e,
+        }
     }
 }
 
@@ -474,6 +490,32 @@ impl<'fd, T: Sendable, const CAP: usize> MMap<'fd, T, CAP> {
             len,
             _fd: fd,
         })
+    }
+}
+
+impl<'fd, T: Sendable, const CAP: usize> AsRef<[u8]> for MMap<'fd, T, CAP> {
+    fn as_ref(&self) -> &[u8] {
+        let data_size = T::data_size();
+
+        let slice = unsafe {
+            let ptr: &u8 = &*(self.raw_ptr as *const u8);
+            std::slice::from_raw_parts(ptr, data_size)
+        };
+
+        slice
+    }
+}
+
+impl<'fd, T: Sendable, const CAP: usize> AsMut<[u8]> for MMap<'fd, T, CAP> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        let data_size = T::data_size();
+
+        let slice = unsafe {
+            let ptr: &mut u8 = &mut *(self.raw_ptr as *mut u8);
+            std::slice::from_raw_parts_mut(ptr, data_size)
+        };
+
+        slice
     }
 }
 

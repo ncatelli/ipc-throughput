@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::Arc;
 
 pub struct MQueueAttr {
@@ -46,14 +47,20 @@ impl MQueueAttr {
 pub struct Sender<'shmfd, T: Sendable, const CAP: usize> {
     mmap: Arc<RefCell<MMap<'shmfd, T, CAP>>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
+    send_queue: Arc<RefCell<MessageQueue<Range<usize>>>>,
 }
 
 impl<'shmfd, T: Sendable, const CAP: usize> Sender<'shmfd, T, CAP> {
     pub fn new(
         mmap: Arc<RefCell<MMap<'shmfd, T, CAP>>>,
         mqueue: Arc<RefCell<MessageQueue<T>>>,
+        send_queue: Arc<RefCell<MessageQueue<Range<usize>>>>,
     ) -> Self {
-        Self { mmap, mqueue }
+        Self {
+            mmap,
+            mqueue,
+            send_queue,
+        }
     }
 }
 
@@ -62,11 +69,25 @@ where
     T: SendEncodable + Sendable,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        const RANGE_SIZE: usize = std::mem::size_of::<usize>() * 2;
+
         let mut queue = self.mqueue.as_ref().borrow_mut();
+        let mut send_queue = self.send_queue.as_ref().borrow_mut();
         let mut mmap_ref = self.mmap.as_ref().borrow_mut();
         let mut mmap: &mut [u8] = mmap_ref.as_mut();
 
-        queue.write(buf).and_then(|_| mmap.write(buf))
+        let wrote_bytes = queue.write(buf).and_then(|_| mmap.write(buf))?;
+        let start = 0_usize.to_ne_bytes();
+        let end = wrote_bytes.to_ne_bytes();
+        let encoded_range = start.iter().chain(end.iter()).enumerate().fold(
+            [0u8; RANGE_SIZE],
+            |mut acc, (idx, x)| {
+                acc[idx] = *x;
+                acc
+            },
+        );
+
+        send_queue.write_all(&encoded_range).map(|_| wrote_bytes)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -77,14 +98,20 @@ where
 pub struct Receiver<'fd, T: Sendable, const CAP: usize> {
     mmap: Arc<RefCell<MMap<'fd, T, CAP>>>,
     mqueue: Arc<RefCell<MessageQueue<T>>>,
+    recv_queue: Arc<RefCell<MessageQueue<Range<usize>>>>,
 }
 
 impl<'fd, T: Sendable, const CAP: usize> Receiver<'fd, T, CAP> {
     pub fn new(
         mmap: Arc<RefCell<MMap<'fd, T, CAP>>>,
         mqueue: Arc<RefCell<MessageQueue<T>>>,
+        recv_queue: Arc<RefCell<MessageQueue<Range<usize>>>>,
     ) -> Self {
-        Self { mmap, mqueue }
+        Self {
+            mmap,
+            mqueue,
+            recv_queue,
+        }
     }
 }
 
@@ -93,21 +120,45 @@ where
     T: SendEncodable + Sendable,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        const RANGE_SIZE: usize = std::mem::size_of::<usize>() * 2;
+
         let mut queue = self.mqueue.as_ref().borrow_mut();
+
+        let mut recv_queue = self.recv_queue.as_ref().borrow_mut();
         let data_size = T::data_size();
         let mmap_ref = self.mmap.as_ref().borrow();
         let mmap: &[u8] = mmap_ref.as_ref();
         let subset = &mmap[0..data_size];
 
-        let read = queue.read(buf);
+        let read_bytes = queue.read(buf)?;
+        // zero the buffer
         buf.fill(0);
-        match read {
-            Ok(read_n) => {
-                (&mut buf[0..data_size]).clone_from_slice(subset);
-                Ok(read_n)
-            }
-            e @ Err(_) => e,
-        }
+
+        let mut recv_range_bytes = [0u8; RANGE_SIZE];
+
+        recv_queue.read_exact(&mut recv_range_bytes)?;
+        let recv_range_bytes_start = &recv_range_bytes[0..std::mem::size_of::<usize>()];
+        let start_bytes = recv_range_bytes_start.iter().enumerate().fold(
+            [0u8; std::mem::size_of::<usize>()],
+            |mut acc, (idx, x)| {
+                acc[idx] = *x;
+                acc
+            },
+        );
+        let recv_range_bytes_end = &recv_range_bytes[std::mem::size_of::<usize>()..];
+        let end_bytes = recv_range_bytes_end.iter().enumerate().fold(
+            [0u8; std::mem::size_of::<usize>()],
+            |mut acc, (idx, x)| {
+                acc[idx] = *x;
+                acc
+            },
+        );
+
+        let start = usize::from_ne_bytes(start_bytes);
+        let end = usize::from_ne_bytes(end_bytes);
+
+        (&mut buf[start..end]).clone_from_slice(&subset[start..end]);
+        Ok(read_bytes)
     }
 }
 
@@ -220,6 +271,13 @@ impl Sendable for usize {
     }
 }
 
+impl Sendable for Range<usize> {
+    fn data_size() -> usize {
+        // equivalent to a [usize; 2] for [start, end].
+        <usize>::data_size() * 2
+    }
+}
+
 #[derive(Clone)]
 pub struct MessageQueue<T: Sendable> {
     _data_type: std::marker::PhantomData<T>,
@@ -329,6 +387,26 @@ impl std::io::Write for MessageQueue<usize> {
     }
 }
 
+impl std::io::Write for MessageQueue<Range<usize>> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let cast_ptr = buf.as_ptr() as *const i8;
+        let data_size = Range::<usize>::data_size();
+
+        let rv = unsafe { libc::mq_send(self.descriptor, cast_ptr, buf.len(), 0) };
+        match rv {
+            0 => Ok(data_size),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "data exceeds message size",
+            )),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl<T> std::io::Read for MessageQueue<T>
 where
     T: SendEncodable + Sendable,
@@ -361,6 +439,36 @@ impl std::io::Read for MessageQueue<usize> {
         // lying to c by casting the pointer.
         let cast_ptr = buf.as_mut_ptr() as *mut i8;
         let data_size = usize::data_size();
+
+        let read_bytes = unsafe {
+            libc::mq_receive(
+                self.descriptor,
+                cast_ptr,
+                data_size,
+                std::ptr::null_mut::<u32>(),
+            )
+        };
+
+        match read_bytes {
+            -1 => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "unable to read from queue",
+            )),
+            read => usize::try_from(read).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "read bytes falls outside expected range.",
+                )
+            }),
+        }
+    }
+}
+
+impl std::io::Read for MessageQueue<Range<usize>> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // lying to c by casting the pointer.
+        let cast_ptr = buf.as_mut_ptr() as *mut i8;
+        let data_size = Range::<usize>::data_size();
 
         let read_bytes = unsafe {
             libc::mq_receive(
@@ -654,6 +762,7 @@ where
 {
     let shm_name = shm.shm_name.to_str().ok()?;
     let queue_name = format!("/{}", shm_name);
+    let send_queue_name = format!("/{}_msg", shm_name);
 
     let attr_msgsize = i64::try_from(T::data_size()).ok()?;
 
@@ -665,13 +774,22 @@ where
     .map(RefCell::new)
     .map(Arc::new)?;
 
+    let send_queue_attr_msgsize = i64::try_from(Range::<usize>::data_size()).ok()?;
+    let send_queue = MessageQueue::<Range<usize>>::try_new_with_attr(
+        &send_queue_name,
+        MQueueFlags::new(MQueueMode::WriteOnly).with_option(MQueueOption::Create),
+        MQueueAttr::new(0, 10, send_queue_attr_msgsize, 0),
+    )
+    .map(RefCell::new)
+    .map(Arc::new)?;
+
     let mmap_flags = MMapFlags::new(MMapMode::Shared);
     let mmap: Arc<RefCell<MMap<T, CAP>>> =
         MMap::try_new(&shm.descriptor, MMapProt::Write, mmap_flags)
             .map(RefCell::new)
             .map(Arc::new)?;
 
-    Some(Sender::new(mmap, mq))
+    Some(Sender::new(mmap, mq, send_queue))
 }
 
 pub fn bounded_sync_receiver<T, const CAP: usize>(
@@ -682,6 +800,7 @@ where
 {
     let shm_name = shm.shm_name.to_str().ok()?;
     let queue_name = format!("/{}", shm_name);
+    let recv_queue_name = format!("/{}_msg", shm_name);
 
     let attr_msgsize = i64::try_from(T::data_size()).ok()?;
 
@@ -693,11 +812,21 @@ where
     .map(RefCell::new)
     .map(Arc::new)?;
 
+    let recv_queue_attr_msgsize = i64::try_from(Range::<usize>::data_size()).ok()?;
+
+    let recv_queue = MessageQueue::<Range<usize>>::try_new_with_attr(
+        &recv_queue_name,
+        MQueueFlags::new(MQueueMode::ReadOnly).with_option(MQueueOption::Create),
+        MQueueAttr::new(0, 10, recv_queue_attr_msgsize, 0),
+    )
+    .map(RefCell::new)
+    .map(Arc::new)?;
+
     let mmap_flags = MMapFlags::new(MMapMode::Shared);
     let mmap: Arc<RefCell<MMap<T, CAP>>> =
         MMap::try_new(&shm.descriptor, MMapProt::Read, mmap_flags)
             .map(RefCell::new)
             .map(Arc::new)?;
 
-    Some(Receiver::new(mmap, mq))
+    Some(Receiver::new(mmap, mq, recv_queue))
 }
